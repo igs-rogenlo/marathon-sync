@@ -1,0 +1,91 @@
+name: 馬拉松表單同步
+
+on:
+  schedule:
+    # 每 30 分鐘一次（GitHub 排程不保證準時，延遲數分鐘屬正常）
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: '往回補幾天的紀錄'
+        required: false
+        default: '3'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: marathon-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 觸發同步
+        env:
+          URL: ${{ secrets.GAS_EXEC_URL }}
+          TOKEN: ${{ secrets.GAS_TOKEN }}
+          DAYS: ${{ github.event.inputs.days || '3' }}
+        run: |
+          set -euo pipefail
+          # 刻意不跟隨轉址：讓試算表那邊只執行一次，避免重複消耗 Strava 額度
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 \
+            "${URL}?action=poll_sync&token=${TOKEN}&days=${DAYS}")
+          echo "觸發回應 HTTP ${code}"
+          if [ "${code}" != "302" ] && [ "${code}" != "200" ]; then
+            echo "::error::無法觸發同步（HTTP ${code}）"
+            exit 1
+          fi
+
+      - name: 等待執行完成
+        run: sleep 45
+
+      - name: 讀取這次同步結果
+        env:
+          URL: ${{ secrets.GAS_EXEC_URL }}
+          TOKEN: ${{ secrets.GAS_TOKEN }}
+        run: |
+          set -euo pipefail
+          out=$(curl -sL --max-time 90 "${URL}?action=poll_status&token=${TOKEN}")
+          ok=$(printf '%s' "${out}" | jq -r '.ok // false')
+          if [ "${ok}" != "true" ]; then
+            echo "::error::讀不到同步狀態"
+            exit 1
+          fi
+          at=$(printf '%s' "${out}" | jq -r '.last_run.at // "無紀錄"')
+          added=$(printf '%s' "${out}" | jq -r '.last_run.added // 0')
+          skipped=$(printf '%s' "${out}" | jq -r '.last_run.skipped // 0')
+          errs=$(printf '%s' "${out}" | jq -r '.last_run.error_count // 0')
+          cut=$(printf '%s' "${out}" | jq -r '.last_run.truncated // false')
+          echo "最後同步：${at}"
+          echo "新增 ${added} 筆｜略過 ${skipped} 筆｜失敗 ${errs} 筆｜未跑完=${cut}"
+          if [ "${errs}" != "0" ]; then
+            echo "::error::這次同步有 ${errs} 筆寫入失敗"
+            exit 1
+          fi
+
+      - name: 取得程式碼
+        if: github.event_name == 'schedule'
+        uses: actions/checkout@v4
+
+      - name: 每天留一次心跳（避免排程被 GitHub 自動停用）
+        if: github.event_name == 'schedule'
+        run: |
+          set -euo pipefail
+          hour=$(date -u +%-H)
+          minute=$(date -u +%-M)
+          if [ "${hour}" -ne 19 ] || [ "${minute}" -ge 30 ]; then
+            echo "這輪不需要心跳"
+            exit 0
+          fi
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > heartbeat.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add heartbeat.txt
+          if git diff --staged --quiet; then
+            echo "沒有變更"
+            exit 0
+          fi
+          git commit -m "心跳 $(date -u +'%Y-%m-%d')"
+          git push
